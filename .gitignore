@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated output
+dns_records/
+
+# Customer data (contains domain names and 1Password vault references)
+customers.csv
