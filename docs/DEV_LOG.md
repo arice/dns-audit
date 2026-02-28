@@ -5,7 +5,7 @@ Previous logs: [2026-02-27](DEV_LOG_2026-02-27.md)
 ## Where We Are
 
 - **Tests:** No test runner — validated by running the script against live data
-- **Latest commit:** `637e288` — Initial commit (uncommitted changes pending)
+- **Latest commit:** `f61b913` — Add email provider detection, archive flag, output fixes
 
 ## Session 1 — Email provider detection, output fixes, archive flag
 
@@ -36,3 +36,22 @@ Previous logs: [2026-02-27](DEV_LOG_2026-02-27.md)
 **What could have gone better:**
 - Missed the `redacted-client-1.example` client reference on first review of `CLAUDE.md` — user caught it; should read more carefully before declaring files safe to push
 - Attempted to re-run the script for validation when user had already tested — should trust user confirmation
+
+## Session 2 — Publish to GitHub
+
+**What was asked:** Create a public GitHub repository and push the project.
+
+**What was built:**
+- Created public repo at https://github.com/arice/dns-audit via `gh repo create`
+- Pushed both commits; `main` now tracks `origin/main`
+
+**Decisions made:**
+- Public repo — tool is general-purpose and README is already written for external users
+- Repo description: "Audit DNS records across a portfolio of domains and sync to 1Password"
+
+**Files modified (0):** none
+
+**Tests:** No code changes this session
+
+**What could have gone better:**
+- Nothing; straightforward push
