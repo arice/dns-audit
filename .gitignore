@@ -3,8 +3,9 @@
 __pycache__/
 *.pyc
 
-# Generated output
+# Generated output (including dated archives)
 dns_records/
+dns_records_*/
 
 # Customer data (contains domain names and 1Password vault references)
 customers.csv

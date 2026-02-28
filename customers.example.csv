@@ -1,4 +1,4 @@
-customer_name,domain,op_reference,vault,notes
-Acme Corp,example.com,Acme DNS Admin,Acme Corp,Main site
-Acme Corp,example.org,Acme DNS Admin,Acme Corp,Redirects to example.com
-Another Client,another.io,,Clients,
+customer_name,domain,vault,notes
+Acme Corp,example.com,Acme Corp,Main site
+Acme Corp,example.org,Acme Corp,Redirects to example.com
+Another Client,another.io,Clients,
