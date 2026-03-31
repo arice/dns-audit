@@ -42,6 +42,12 @@ except ImportError:
 
 RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "CNAME", "NS", "SOA", "SRV", "CAA"]
 
+COMMON_SUBDOMAINS = [
+    "www", "mail", "email", "webmail", "smtp", "imap", "pop", "ftp",
+    "autodiscover", "autoconfig", "blog", "shop", "store", "app",
+    "api", "cdn", "media", "static", "assets",
+]
+
 DKIM_SELECTORS = [
     "google", "selector1", "selector2", "default", "mail", "dkim",
     "k1", "k2", "smtp", "email", "s1", "s2", "key1", "key2",
@@ -135,44 +141,83 @@ def op_note_title(domain: str) -> str:
 # DNS helpers
 # ---------------------------------------------------------------------------
 
+_dns_cache: dict[tuple[str, str], list[str]] = {}
+_ttl_cache: dict[tuple[str, str], int | str] = {}
+
+
 def query_record(domain: str, rtype: str) -> list[str]:
-    """Return a list of string-formatted answers, or [] on any failure."""
-    try:
-        resolver = dns.resolver.Resolver()
-        resolver.lifetime = 8
-        answers = resolver.resolve(domain, rtype)
-        return [rdata.to_text() for rdata in answers]
-    except (
-        dns.resolver.NXDOMAIN,
-        dns.resolver.NoAnswer,
-        dns.resolver.NoNameservers,
-        dns.exception.Timeout,
-        dns.exception.DNSException,
-    ):
-        return []
+    """Return a list of string-formatted answers, or [] on any failure.
+    Results are cached so repeated calls for the same name/type are free."""
+    key = (domain.lower(), rtype)
+    if key not in _dns_cache:
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = 8
+            answers = resolver.resolve(domain, rtype)
+            _dns_cache[key] = [rdata.to_text() for rdata in answers]
+            _ttl_cache[key] = answers.rrset.ttl if answers.rrset else "—"
+        except (
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers,
+            dns.exception.Timeout,
+            dns.exception.DNSException,
+        ):
+            _dns_cache[key] = []
+            _ttl_cache[key] = "—"
+    return _dns_cache[key]
+
+
+def get_ttl(domain: str, rtype: str) -> int | str:
+    """Return the cached TTL for a record type, querying first if needed."""
+    key = (domain.lower(), rtype)
+    if key not in _ttl_cache:
+        query_record(domain, rtype)
+    return _ttl_cache.get(key, "—")
 
 
 def get_subdomains_crtsh(domain: str) -> list[str]:
     """
-    Fetch subdomains from Certificate Transparency logs via crt.sh.
+    Fetch subdomains from Certificate Transparency logs via crt.sh, then
+    supplement with a wordlist probe for common names that may lack certs.
     Returns a sorted, deduplicated list of subdomains (excluding the apex).
     """
+    subdomains: set[str] = set()
+
     try:
         url = f"https://crt.sh/?q=%.{domain}&output=json"
         resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            return []
-        entries = resp.json()
-        subdomains: set[str] = set()
-        for entry in entries:
-            for name in entry.get("name_value", "").splitlines():
-                name = name.strip().lstrip("*.")
-                if name.endswith(f".{domain}") and name != domain:
-                    subdomains.add(name.lower())
-        return sorted(subdomains)
+        if resp.status_code == 200:
+            for entry in resp.json():
+                for name in entry.get("name_value", "").splitlines():
+                    name = name.strip().lstrip("*.")
+                    if name.endswith(f".{domain}") and name != domain:
+                        subdomains.add(name.lower())
     except Exception as exc:
         print(f"    [warn] crt.sh lookup failed for {domain}: {exc}")
-        return []
+
+    # Probe common subdomain names that may not appear in cert logs.
+    # Use a canary query to detect wildcard DNS (e.g. Cloudflare proxying all
+    # subdomains) so we don't add bogus wordlist hits. crt.sh results above are
+    # always kept — they represent real issued certificates.
+    canary = f"__wildcard-canary__.{domain}"
+    canary_a    = set(query_record(canary, "A"))
+    canary_cname = query_record(canary, "CNAME")
+    for label in COMMON_SUBDOMAINS:
+        fqdn = f"{label}.{domain}"
+        if fqdn in subdomains:
+            continue
+        cname = query_record(fqdn, "CNAME")
+        a = set(query_record(fqdn, "A"))
+        if not a and not cname:
+            continue  # doesn't resolve at all
+        if canary_a and a == canary_a and not cname:
+            continue  # wildcard hit via A records
+        if canary_cname and cname == canary_cname:
+            continue  # wildcard hit via CNAME
+        subdomains.add(fqdn)
+
+    return sorted(subdomains)
 
 
 # ---------------------------------------------------------------------------
@@ -453,13 +498,7 @@ def build_markdown(
             continue
         any_records = True
 
-        try:
-            resolver = dns.resolver.Resolver()
-            resolver.lifetime = 8
-            raw = resolver.resolve(domain, rtype)
-            ttl = raw.rrset.ttl if raw.rrset else "—"
-        except Exception:
-            ttl = "—"
+        ttl = get_ttl(domain, rtype)
 
         lines += [f"### {rtype}  (TTL: {ttl})", "", "```"]
         # Strip surrounding quotes and join multi-chunk strings (dnspython renders

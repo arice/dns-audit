@@ -27,6 +27,8 @@ For each domain it:
 
 ## Setup
 
+Do this once when you first clone the repo:
+
 ```bash
 # Create a virtualenv and install dependencies
 python3 -m venv .venv
@@ -40,6 +42,20 @@ cp customers.example.csv customers.csv
 ---
 
 ## Usage
+
+Each session, activate the virtualenv before running the script (no need to reinstall dependencies):
+
+```bash
+source .venv/bin/activate
+```
+
+If you're using `--op-sync`, sign in to 1Password first:
+
+```bash
+op signin
+```
+
+Then run the script:
 
 ```bash
 # Write .md files only

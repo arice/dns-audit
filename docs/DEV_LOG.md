@@ -1,57 +1,52 @@
-# Dev Log — 2026-02-28
+# Dev Log — 2026-03-31
 
-Previous logs: [2026-02-27](DEV_LOG_2026-02-27.md)
+Previous logs: [2026-02-28](DEV_LOG_2026-02-28.md)
 
 ## Where We Are
 
 - **Tests:** No test runner — validated by running the script against live data
-- **Latest commit:** `f61b913` — Add email provider detection, archive flag, output fixes
+- **Latest commit:** `55af726` — Update dev log (dns_fetch.py has uncommitted changes)
 
-## Session 1 — Email provider detection, output fixes, archive flag
+## Session 1 — README usage clarifications
 
-**What was asked:** Add email provider detection from MX records; fix split TXT string display; expand NS provider lookup table; add `--archive` flag for dated snapshots; update README output format example; improve `notes` field documentation; remove "quarterly" framing.
-
-**What was built:**
-- `guess_email_provider()` — maps MX hostnames to provider names via lookup table (~25 providers)
-- `MX_PROVIDERS` lookup table covering Google Workspace, M365, Fastmail, Zoho, Proofpoint, Mimecast, GoDaddy, Namecheap, Rackspace, Proton, and more
-- Added **Email provider** line to the Hosting section in output and in `build_markdown()`
-- Fixed split TXT/DKIM record display — stripped inner `" "` chunk separators that dnspython adds to long records
-- Expanded NS provider lookup table with pair Networks, InMotion, SiteGround, DNS Made Easy, Fastmail, Sucuri, IONOS/1&1
-- `--archive` flag: copies `dns_records/` to `dns_records_YYYY-MM-DD/` (dated by existing files' mtime) before overwriting; skips silently if archive already exists
-- Removed stale orphan file `hcsfound_org.md`
-- Removed client references (`redacted-client-1.example`, `Redacted Client 2`) from `CLAUDE.md`
-- Updated README output format example to accurately show all sections with correct code block nesting (using `~~~` outer fence)
-- Clarified `notes` column documents as appearing in both `.md` and 1Password note
-- Removed "quarterly" framing throughout; reframed as general-purpose recurring tool
-
-**Decisions made:**
-- Archive date based on mtime of existing files, not today — so snapshots are named after when data was captured, not when you ran the script
-- Skip archive silently if destination exists (idempotent re-runs on same day)
-- Email provider shown in Hosting section alongside DNS and web host
-
-**Files modified (3):** `dns_fetch.py`, `README.md`, `CLAUDE.md`
-
-**Tests:** Validated by full run against 36 domains with `--archive` and `--op-sync`
-
-**What could have gone better:**
-- Missed the `redacted-client-1.example` client reference on first review of `CLAUDE.md` — user caught it; should read more carefully before declaring files safe to push
-- Attempted to re-run the script for validation when user had already tested — should trust user confirmation
-
-## Session 2 — Publish to GitHub
-
-**What was asked:** Create a public GitHub repository and push the project.
+**What was asked:** (1) Document that `op signin` is required before `--op-sync`; (2) clarify that venv setup is one-time only and daily usage just needs `source .venv/bin/activate`.
 
 **What was built:**
-- Created public repo at https://github.com/arice/dns-audit via `gh repo create`
-- Pushed both commits; `main` now tracks `origin/main`
+- Added "Do this once when you first clone the repo" framing to Setup section
+- Split Usage section to show venv activation as a per-session step (not setup)
+- Added `op signin` step with note it's only needed for `--op-sync`
+- Corrected `eval $(op signin)` (old v1 pattern) to plain `op signin` after user correction
 
 **Decisions made:**
-- Public repo — tool is general-purpose and README is already written for external users
-- Repo description: "Audit DNS records across a portfolio of domains and sync to 1Password"
+- `op signin` not `eval $(op signin)` — v2 CLI doesn't require the eval wrapper
 
-**Files modified (0):** none
+**Files modified (1):** `README.md`
 
-**Tests:** No code changes this session
+**Tests:** No code changes; README reviewed for correctness
 
 **What could have gone better:**
-- Nothing; straightforward push
+- Used `eval $(op signin)` initially — that's the v1 pattern. Should have defaulted to plain `op signin` for the modern CLI.
+
+## Session 2 — Subdomain discovery improvements + bug fixes
+
+**What was asked:** Add wordlist-based subdomain probing to catch subdomains missing from crt.sh (e.g. those without TLS certs). Fix false positives caused by Cloudflare wildcard DNS. Then fix three bugs identified in a senior code review.
+
+**What was built:**
+- Added `COMMON_SUBDOMAINS` wordlist (19 entries) probed after crt.sh lookup
+- Canary query (`__wildcard-canary__.<domain>`) to detect wildcard DNS — checks both A records and CNAME to handle CNAME-only wildcards (e.g. some CDNs)
+- Module-level `_dns_cache` and `_ttl_cache` — all `query_record()` calls are now cached, eliminating redundant queries for the same name/type
+- `get_ttl()` helper reads TTL from cache; `build_markdown` now uses it instead of re-querying each record type for its TTL
+- Wildcard filter applied only to wordlist probes; crt.sh results always kept (they represent real issued certs)
+
+**Decisions made:**
+- crt.sh results are unconditionally trusted — certificate issuance proves the subdomain existed; wildcard filtering only applies to wordlist guesses
+- Canary subdomain (`__wildcard-canary__`) is guaranteed not to be a real name, so any resolution it returns is definitively a wildcard
+- Cache is module-level (not per-run) which is fine since the script is a single-shot process
+
+**Files modified (1):** `dns_fetch.py`
+
+**Tests:** Syntax check passes; runtime validation pending live run
+
+**What could have gone better:**
+- First wildcard fix applied the filter in `build_markdown` to all subdomains including crt.sh results — user correctly pointed out that discards valid subdomains. Should have distinguished crt.sh vs wordlist sources from the start.
+- First canary implementation only checked A records, missing CNAME-only wildcards — caught in code review.
