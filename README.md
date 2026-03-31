@@ -9,7 +9,7 @@ For each domain it:
 - Checks HTTP→HTTPS redirect behavior and apex/www redirect
 - Checks email security: SPF, DMARC, and DKIM (common selectors)
 - Looks up domain expiry via WHOIS
-- Discovers subdomains via Certificate Transparency logs (crt.sh)
+- Discovers subdomains via Certificate Transparency logs (crt.sh) and a common-name wordlist probe
 - Resolves A, AAAA, and CNAME for each subdomain
 - Writes one Markdown file per domain to `./dns_records/`
 - Writes a `dns_renewals.ics` calendar file with 60- and 30-day renewal alarms
@@ -169,6 +169,6 @@ mail.example.com
 
 ## Limitations
 
-- Subdomain discovery only finds names that have had a TLS certificate issued. Subdomains that have never had a cert won't appear.
+- Subdomain discovery combines crt.sh (certificate transparency) with a wordlist probe of ~20 common names (`www`, `mail`, `api`, etc.). Subdomains outside both sources won't appear. Domains using wildcard DNS (e.g. Cloudflare proxying all subdomains) are detected and wordlist false-positives are suppressed.
 - Zone transfers (AXFR) are not attempted — public resolvers almost never allow them.
 - TTLs shown are live at query time and may reflect upstream caching.
