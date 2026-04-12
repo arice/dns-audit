@@ -605,16 +605,13 @@ def main() -> None:
 
     # Archive existing output before overwriting
     if args.archive and OUTPUT_DIR.exists():
-        existing = sorted(OUTPUT_DIR.glob("*.md"))
-        if existing:
+        run_date_file = OUTPUT_DIR / ".run_date"
+        if run_date_file.exists():
             import shutil
-            run_date = date.fromtimestamp(existing[0].stat().st_mtime).strftime("%Y-%m-%d")
-            archive_path = Path(f"{OUTPUT_DIR}_{run_date}")
-            if archive_path.exists():
-                print(f"  Archive {archive_path}/ already exists — skipping.\n")
-            else:
-                shutil.copytree(OUTPUT_DIR, archive_path)
-                print(f"✓ Archived previous output → {archive_path}/\n")
+            run_stamp = run_date_file.read_text().strip()
+            archive_path = Path(f"{OUTPUT_DIR}_{run_stamp}")
+            shutil.copytree(OUTPUT_DIR, archive_path)
+            print(f"✓ Archived previous output → {archive_path}/\n")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -716,6 +713,7 @@ def main() -> None:
         write_ics(domain_expiries, ics_path)
         print(f"✓ Renewal calendar → {ics_path}  ({len(domain_expiries)} domain(s))")
 
+    (OUTPUT_DIR / ".run_date").write_text(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     print(f"\nDone. Markdown files written to ./{OUTPUT_DIR}/")
     if args.op_sync:
         print("1Password notes created/updated where vault was specified.")
