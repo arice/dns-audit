@@ -34,7 +34,7 @@ Do this once when you first clone the repo:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install dnspython requests python-whois cryptography
+pip install -r requirements.txt
 
 cp customers.example.csv customers.csv  # then edit to add your domains
 ```

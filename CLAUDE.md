@@ -9,7 +9,7 @@ Always use the virtualenv. If it doesn't exist yet:
 ```bash
 /opt/homebrew/bin/python3 -m venv .venv --clear
 source .venv/bin/activate
-pip install requests dnspython python-whois
+pip install -r requirements.txt
 ```
 
 To activate an existing venv:
