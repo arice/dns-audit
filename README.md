@@ -4,23 +4,25 @@ A lightweight script for managed service providers and consultants who need to p
 
 For each domain it:
 
-- Queries all standard DNS record types (A, AAAA, MX, TXT, CNAME, NS, SOA, SRV, CAA)
-- Identifies the DNS provider (from nameservers) and web host (from reverse DNS)
+- Queries standard DNS record types (A, AAAA, MX, TXT, CNAME, NS, SOA, SRV, CAA)
+- Identifies the DNS provider (from nameservers), web host (from reverse DNS), and email provider (from MX)
+- Pulls registrar, registrant, created/updated/expires dates, status codes, and DNSSEC flag from WHOIS
+- Inspects the live TLS certificate on the apex (falling back to `www.`) for issuer, validity dates, and SANs
 - Checks HTTP→HTTPS redirect behavior and apex/www redirect
 - Checks email security: SPF, DMARC, and DKIM (common selectors)
-- Looks up domain expiry via WHOIS
-- Discovers subdomains via Certificate Transparency logs (crt.sh) and a common-name wordlist probe
-- Resolves A, AAAA, and CNAME for each subdomain
+- Discovers subdomains via Certificate Transparency logs (crt.sh) plus a 19-name wordlist probe, with wildcard-DNS detection to suppress false positives
+- Surfaces risk flags at the top of each report (imminent expiries, missing transfer lock, no DNSSEC/SPF/DMARC/CAA, etc.)
 - Writes one Markdown file per domain to `./dns_records/`
-- Writes a `dns_renewals.ics` calendar file with 60- and 30-day renewal alarms
+- Writes a `dns_records/dns_renewals.ics` calendar with renewal alarms for domain registrations (60/30/15/1-day) and non-auto-renewing TLS certs (30/15/1-day; Let's Encrypt certs are skipped since they auto-renew)
 - Optionally creates or updates a Secure Note in 1Password via the `op` CLI
+
+See [sample-output.md](sample-output.md) for a real example (output from `apple.com`).
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- `dnspython`, `requests`, and `python-whois` (`pip install dnspython requests python-whois`)
 - (Optional) [1Password CLI](https://developer.1password.com/docs/cli/) for `--op-sync`
 
 ---
@@ -30,145 +32,51 @@ For each domain it:
 Do this once when you first clone the repo:
 
 ```bash
-# Create a virtualenv and install dependencies
 python3 -m venv .venv
 source .venv/bin/activate
-pip install dnspython requests python-whois
+pip install dnspython requests python-whois cryptography
 
-# Copy the example and fill in your domains
-cp customers.example.csv customers.csv
+cp customers.example.csv customers.csv  # then edit to add your domains
 ```
 
----
-
-## Usage
-
-Each session, activate the virtualenv before running the script (no need to reinstall dependencies):
-
-```bash
-source .venv/bin/activate
-```
-
-If you're using `--op-sync`, sign in to 1Password first:
-
-```bash
-op signin
-```
-
-Then run the script:
-
-```bash
-# Write .md files only
-python dns_fetch.py
-
-# Write .md files AND push to 1Password
-python dns_fetch.py --op-sync
-
-# Archive the previous run's output before overwriting
-python dns_fetch.py --archive
-
-# All three together
-python dns_fetch.py --archive --op-sync
-```
-
-Output files are written to `./dns_records/<domain>.md`. A single `dns_records/dns_renewals.ics` calendar file is also written containing renewal reminders for every domain where expiry was found, with 60- and 30-day alarms.
-
-When `--op-sync` is used, a Secure Note named `DNS: <domain>` is created or updated in the 1Password vault specified in `customers.csv`. Requires `op` to be installed and signed in (`op whoami` should return your account).
-
----
-
-## customers.csv
-
-`customers.csv` is not included in this repo. Create one based on `customers.example.csv`:
+`customers.csv` is gitignored. Columns:
 
 | Column | Required | Description |
 |--------|----------|-------------|
 | `customer_name` | Yes | Display name for the customer |
 | `domain` | Yes | Apex domain to audit (e.g. `example.com`) |
-| `vault` | No* | 1Password vault to write the Secure Note into. Must match the vault name exactly. Required if using `--op-sync`. |
-| `notes` | No | Free-form notes (e.g. "Redirects to main domain"). Included in the output `.md` file and in the 1Password note if `--op-sync` is used. |
+| `vault` | If using `--op-sync` | 1Password vault to write the Secure Note into. Must match the vault name exactly — run `op vault list` to check. |
+| `notes` | No | Free-form notes (included in the output `.md` and 1Password note) |
 
-Multiple rows for the same customer/vault are fine (e.g. if they have more than one domain).
-
----
-
-## Output format
-
-Each `dns_records/<domain>.md` file looks like:
-
-~~~
-# example.com
-
-**Customer:** Acme Corp
-**Last updated:** 2026-02-27
-**Domain expires:** 2027-03-15 (382 days)
-
-## Hosting
-
-**DNS provider:** Cloudflare
-**Web host:** cloudflare.net (93.184.216.34)
-**Email provider:** Google Workspace
-
-## HTTP Redirects
-
-**HTTP → HTTPS:** Yes
-**www redirect:** example.com → www.example.com (301)
-
-## Email Security
-
-**SPF:** ✓
-```
-v=spf1 include:_spf.google.com ~all
-```
-
-**DMARC:** ✓
-```
-v=DMARC1; p=reject; rua=mailto:dmarc@example.com
-```
-
-**DKIM:** ✓ (selectors: google)
-```
-google._domainkey
-  v=DKIM1; k=rsa; p=MIGfMA0G...
-```
-
-## DNS Records
-
-### A  (TTL: 300)
-
-```
-93.184.216.34
-```
-
-### MX  (TTL: 3600)
-
-```
-10 mail.example.com.
-```
-
-## Subdomains (via crt.sh)
-
-```
-mail.example.com
-  A:     93.184.216.34
-  AAAA:  —
-  CNAME: —
-```
-~~~
+Multiple rows per customer are fine (e.g. a client with several domains).
 
 ---
 
-## Tips
+## Usage
 
-- **Re-run safely**: the script overwrites existing output files, so it's safe to run as often as you like.
-- **Snapshots**: pass `--archive` to save a copy of the previous results before overwriting them. The archive folder is named after the date of the previous run (e.g. `dns_records_2026-01-15/`), so your snapshots stay organized by when the data was captured. If you run `--archive` twice in the same day, the second run will skip the copy since the archive already exists.
-- **Rate limiting**: the script waits 1.5 seconds between crt.sh lookups. For large portfolios this adds up but keeps the requests polite.
-- **1Password vault names** must match exactly — run `op vault list` to check.
+Activate the virtualenv each session:
+
+```bash
+source .venv/bin/activate
+```
+
+If you're using `--op-sync`, also sign in to 1Password (`op signin`).
+
+```bash
+python dns_fetch.py                       # write .md files only
+python dns_fetch.py --op-sync             # also push to 1Password
+python dns_fetch.py --archive             # snapshot previous run first
+python dns_fetch.py --archive --op-sync   # all three together
+```
+
+Output goes to `./dns_records/<domain>.md`, with `dns_renewals.ics` written alongside for any domains that had a discoverable expiry date. Re-runs overwrite, so the script is safe to run as often as you like. The script sleeps 1.5s between domains to be polite to crt.sh.
+
+`--archive` copies the existing `dns_records/` to `dns_records_<timestamp>/` (e.g. `dns_records_2026-05-13_10-30-45/`) using the timestamp recorded at the end of the previous run, so snapshots are labelled by when their data was captured. The archive will fail if the destination directory already exists — delete or rename it first if you need to re-archive.
+
+With `--op-sync`, a Secure Note named `DNS: <domain>` is created or updated in the vault from `customers.csv`. Rows with no vault are skipped for sync but still get a `.md` file.
 
 ---
 
-## Limitations
+## Possible future improvements
 
-- Subdomain discovery combines crt.sh (certificate transparency) with a wordlist probe of ~20 common names (`www`, `mail`, `api`, etc.). Subdomains outside both sources won't appear. Domains using wildcard DNS (e.g. Cloudflare proxying all subdomains) are detected and wordlist false-positives are suppressed.
-- Zone transfers (AXFR) are not attempted — public resolvers almost never allow them.
-- TTLs shown are live at query time and may reflect upstream caching.
+- **Recursive SPF expansion.** Walk `include:` / `redirect=` chains to produce a flat list of authorized sending IPs and a DNS-lookup count. Would catch hitting the 10-lookup limit (which silently breaks deliverability) and would make SPF drift visible across archived runs (e.g. a new SendGrid include appearing without warning). Costs: more DNS queries per domain and a much longer SPF section. Worth doing if email-spoofing posture becomes a focus.

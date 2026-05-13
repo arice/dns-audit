@@ -338,20 +338,129 @@ def get_dkim(domain: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Domain expiry
+# WHOIS
 # ---------------------------------------------------------------------------
 
-def get_domain_expiry(domain: str) -> datetime | None:
-    """Return the domain's expiry date from WHOIS, or None on failure."""
+def _first(value):
+    """WHOIS fields are sometimes a list, sometimes scalar — normalize to scalar."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def get_whois_info(domain: str) -> dict:
+    """
+    Return a dict of WHOIS fields. Any field may be None if WHOIS didn't
+    return it or parsing failed.
+
+    Keys: registrar, registrant_org, created, updated, expires, status,
+          dnssec, nameservers
+    """
+    out: dict = {
+        "registrar": None, "registrant_org": None,
+        "created": None, "updated": None, "expires": None,
+        "status": [], "dnssec": None, "nameservers": [],
+    }
     try:
         w = whois_lib.whois(domain)
-        exp = w.expiration_date
-        if isinstance(exp, list):
-            exp = exp[0]
-        if isinstance(exp, datetime):
-            return exp
+        out["registrar"]       = _first(w.registrar)
+        out["registrant_org"]  = _first(w.org)
+        out["created"]         = _first(w.creation_date)
+        out["updated"]         = _first(w.updated_date)
+        out["expires"]         = _first(w.expiration_date)
+        out["dnssec"]          = _first(w.dnssec)
+        status = w.status if isinstance(w.status, list) else ([w.status] if w.status else [])
+        # Some registrars return both `…icann.org/epp#…` and `…www.icann.org/epp#…` variants —
+        # dedupe by the EPP code (first whitespace-separated token).
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for s in status:
+            if not s:
+                continue
+            code = s.split()[0].lower()
+            if code in seen:
+                continue
+            seen.add(code)
+            deduped.append(s)
+        out["status"] = deduped
+        ns = w.name_servers if isinstance(w.name_servers, list) else ([w.name_servers] if w.name_servers else [])
+        out["nameservers"] = sorted({n.lower().rstrip(".") for n in ns if n})
     except Exception:
         pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# TLS certificate
+# ---------------------------------------------------------------------------
+
+def get_cert_info(host: str, port: int = 443) -> dict | None:
+    """
+    Open a TLS connection to host:port and return certificate metadata.
+    Uses an unverified handshake + DER parsing so we can still inspect
+    expired, self-signed, or hostname-mismatched certs.
+
+    Returns None on any failure (no DNS, no listener, handshake error, etc.).
+
+    Keys: subject_cn, sans, issuer_org, issuer_cn, not_before, not_after,
+          is_lets_encrypt
+    """
+    import socket
+    import ssl
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtensionOID
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=8) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        if not der:
+            return None
+        cert = x509.load_der_x509_certificate(der)
+    except Exception:
+        return None
+
+    def _first_attr(name, oid):
+        attrs = name.get_attributes_for_oid(oid)
+        return attrs[0].value if attrs else None
+
+    subject_cn = _first_attr(cert.subject, NameOID.COMMON_NAME)
+    issuer_cn  = _first_attr(cert.issuer,  NameOID.COMMON_NAME)
+    issuer_org = _first_attr(cert.issuer,  NameOID.ORGANIZATION_NAME)
+
+    sans: list[str] = []
+    try:
+        ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        sans = ext.value.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        pass
+
+    is_le = bool(
+        (issuer_org and "let's encrypt" in issuer_org.lower())
+        or (issuer_cn and "let's encrypt" in issuer_cn.lower())
+    )
+
+    return {
+        "subject_cn":      subject_cn,
+        "sans":            sans,
+        "issuer_org":      issuer_org,
+        "issuer_cn":       issuer_cn,
+        "not_before":      cert.not_valid_before_utc.replace(tzinfo=None),
+        "not_after":       cert.not_valid_after_utc.replace(tzinfo=None),
+        "is_lets_encrypt": is_le,
+    }
+
+
+def pick_cert(domain: str) -> dict | None:
+    """Return cert info for apex if available, otherwise www.<domain>, else None."""
+    for host in (domain, f"www.{domain}"):
+        info = get_cert_info(host)
+        if info:
+            info["host"] = host
+            return info
     return None
 
 
@@ -359,47 +468,64 @@ def get_domain_expiry(domain: str) -> datetime | None:
 # ICS calendar
 # ---------------------------------------------------------------------------
 
-def write_ics(domain_expiries: list[tuple[str, str, datetime]], output_path: Path) -> None:
+def _vevent(kind: str, customer_name: str, domain: str, when: datetime, alarms: list[int]) -> list[str]:
     """
-    Write a single .ics file with one VEVENT per domain, with 60- and
-    30-day reminder alarms.
+    Build a single VEVENT block. `kind` is "Domain renewal" or "TLS cert renewal".
+    `alarms` is a list of days-before-event for DISPLAY alarms.
+    """
+    dtstart = when.strftime("%Y%m%d")
+    dtend   = (when + timedelta(days=1)).strftime("%Y%m%d")
+    slug    = "domain" if kind.startswith("Domain") else "cert"
+    uid     = f"dns-audit-{slug}-{domain}-{dtstart}@dns-audit"
+    desc    = (
+        f"{kind}\\n"
+        f"Domain: {domain}\\n"
+        f"Customer: {customer_name}\\n"
+        f"Expires: {when.strftime('%Y-%m-%d')}"
+    )
+    block = [
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTART;VALUE=DATE:{dtstart}",
+        f"DTEND;VALUE=DATE:{dtend}",
+        f"SUMMARY:{kind}: {domain}",
+        f"DESCRIPTION:{desc}",
+    ]
+    for days in alarms:
+        block += [
+            "BEGIN:VALARM",
+            f"TRIGGER:-P{days}D",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{days}-day reminder ({kind.lower()}): {domain}",
+            "END:VALARM",
+        ]
+    block.append("END:VEVENT")
+    return block
 
-    domain_expiries: list of (customer_name, domain, expiry_datetime)
+
+def write_ics(
+    domain_expiries: list[tuple[str, str, datetime]],
+    cert_expiries: list[tuple[str, str, datetime]],
+    output_path: Path,
+) -> None:
+    """
+    Write a single .ics file with VEVENTs for both domain renewals and
+    non-auto-renewing TLS cert expiries.
+
+    domain_expiries: list of (customer_name, domain, expiry_datetime) — 60/30/15/1-day alarms
+    cert_expiries:   list of (customer_name, domain, not_after)       — 30/15/1-day alarms
     """
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//dns-audit//EN",
         "CALSCALE:GREGORIAN",
+        "X-WR-CALNAME:Domain & TLS Renewal Reminders",
     ]
     for customer_name, domain, expiry in domain_expiries:
-        dtstart = expiry.strftime("%Y%m%d")
-        dtend   = (expiry + timedelta(days=1)).strftime("%Y%m%d")
-        uid     = f"dns-audit-{domain}-{dtstart}@dns-audit"
-        desc    = (
-            f"Domain: {domain}\\n"
-            f"Customer: {customer_name}\\n"
-            f"Expires: {expiry.strftime('%Y-%m-%d')}"
-        )
-        lines += [
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTART;VALUE=DATE:{dtstart}",
-            f"DTEND;VALUE=DATE:{dtend}",
-            f"SUMMARY:Domain renewal: {domain}",
-            f"DESCRIPTION:{desc}",
-            "BEGIN:VALARM",
-            "TRIGGER:-P60D",
-            "ACTION:DISPLAY",
-            f"DESCRIPTION:60-day renewal reminder: {domain}",
-            "END:VALARM",
-            "BEGIN:VALARM",
-            "TRIGGER:-P30D",
-            "ACTION:DISPLAY",
-            f"DESCRIPTION:30-day renewal reminder: {domain}",
-            "END:VALARM",
-            "END:VEVENT",
-        ]
+        lines += _vevent("Domain renewal", customer_name, domain, expiry, [60, 30, 15, 1])
+    for customer_name, domain, not_after in cert_expiries:
+        lines += _vevent("TLS cert renewal", customer_name, domain, not_after, [30, 15, 1])
     lines.append("END:VCALENDAR")
     output_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
@@ -407,6 +533,59 @@ def write_ics(domain_expiries: list[tuple[str, str, datetime]], output_path: Pat
 # ---------------------------------------------------------------------------
 # Markdown generation
 # ---------------------------------------------------------------------------
+
+def compute_risk_flags(
+    records: dict[str, list[str]],
+    email_sec: dict | None,
+    whois_info: dict | None,
+    cert: dict | None,
+) -> list[str]:
+    """Return a list of human-readable risk flags. Empty list = clean."""
+    flags: list[str] = []
+    today = date.today()
+
+    # Domain expiry < 60 days
+    if whois_info and whois_info.get("expires"):
+        exp = whois_info["expires"]
+        if isinstance(exp, datetime):
+            days = (exp.date() - today).days
+            if days < 60:
+                flags.append(f"Domain expires in {days} days ({exp.strftime('%Y-%m-%d')})")
+
+    # Cert expiry < 30 days (skip Let's Encrypt — auto-renews)
+    if cert and cert.get("not_after") and not cert.get("is_lets_encrypt"):
+        days = (cert["not_after"].date() - today).days
+        if days < 30:
+            flags.append(f"TLS cert expires in {days} days ({cert['not_after'].strftime('%Y-%m-%d')})")
+
+    # Transfer lock missing
+    if whois_info:
+        status = " ".join(whois_info.get("status") or []).lower()
+        if status and "clienttransferprohibited" not in status:
+            flags.append("No clientTransferProhibited status (transfer lock missing)")
+
+    # DNSSEC
+    if whois_info:
+        dnssec = (whois_info.get("dnssec") or "")
+        if isinstance(dnssec, str) and dnssec.lower() in ("", "unsigned", "no"):
+            flags.append("DNSSEC not enabled")
+
+    # Email security
+    if email_sec:
+        if not email_sec.get("spf"):
+            flags.append("No SPF record")
+        dmarc = email_sec.get("dmarc") or ""
+        if not dmarc:
+            flags.append("No DMARC record")
+        elif "p=none" in dmarc.lower():
+            flags.append("DMARC policy is p=none (monitoring only)")
+
+    # CAA
+    if not records.get("CAA"):
+        flags.append("No CAA records (any CA may issue certificates)")
+
+    return flags
+
 
 def build_markdown(
     customer_name: str,
@@ -417,10 +596,13 @@ def build_markdown(
     hosting: dict | None = None,
     email_sec: dict | None = None,
     redirects: dict | None = None,
-    expiry: datetime | None = None,
+    whois_info: dict | None = None,
+    cert: dict | None = None,
 ) -> str:
     today = date.today().strftime("%Y-%m-%d")
     lines: list[str] = []
+
+    expires = whois_info.get("expires") if whois_info else None
 
     # --- Header ---
     lines += [
@@ -429,12 +611,65 @@ def build_markdown(
         f"**Customer:** {customer_name}  ",
         f"**Last updated:** {today}  ",
     ]
-    if expiry:
-        days = (expiry.date() - date.today()).days
-        lines.append(f"**Domain expires:** {expiry.strftime('%Y-%m-%d')} ({days} days)  ")
+    if isinstance(expires, datetime):
+        days = (expires.date() - date.today()).days
+        lines.append(f"**Domain expires:** {expires.strftime('%Y-%m-%d')} ({days} days)  ")
     if notes:
         lines.append(f"**Notes:** {notes}  ")
     lines.append("")
+
+    # --- Risk Flags ---
+    flags = compute_risk_flags(records, email_sec, whois_info, cert)
+    if flags:
+        lines += ["## Risk Flags", ""]
+        for f in flags:
+            lines.append(f"- ⚠ {f}")
+        lines.append("")
+
+    # --- Registration (WHOIS) ---
+    if whois_info and any(whois_info.get(k) for k in ("registrar", "registrant_org", "created", "updated", "expires", "status", "dnssec")):
+        lines += ["## Registration", ""]
+        if whois_info.get("registrar"):
+            lines.append(f"**Registrar:** {whois_info['registrar']}  ")
+        if whois_info.get("registrant_org"):
+            lines.append(f"**Registrant org:** {whois_info['registrant_org']}  ")
+        for label, key in [("Created", "created"), ("Updated", "updated"), ("Expires", "expires")]:
+            v = whois_info.get(key)
+            if isinstance(v, datetime):
+                lines.append(f"**{label}:** {v.strftime('%Y-%m-%d')}  ")
+        if whois_info.get("dnssec"):
+            lines.append(f"**DNSSEC:** {whois_info['dnssec']}  ")
+        if whois_info.get("status"):
+            status_list = whois_info["status"]
+            if len(status_list) == 1:
+                lines.append(f"**Status:** {status_list[0]}  ")
+            else:
+                lines.append("**Status:**  ")
+                for s in status_list:
+                    lines.append(f"- {s}")
+        lines.append("")
+
+    # --- TLS Certificate ---
+    if cert:
+        lines += ["## TLS Certificate", ""]
+        lines.append(f"**Checked host:** {cert.get('host', domain)}  ")
+        if cert.get("subject_cn"):
+            lines.append(f"**Subject CN:** {cert['subject_cn']}  ")
+        issuer = cert.get("issuer_org") or cert.get("issuer_cn") or "—"
+        le_tag = " (auto-renew)" if cert.get("is_lets_encrypt") else ""
+        lines.append(f"**Issuer:** {issuer}{le_tag}  ")
+        nb, na = cert.get("not_before"), cert.get("not_after")
+        if isinstance(nb, datetime):
+            lines.append(f"**Not before:** {nb.strftime('%Y-%m-%d')}  ")
+        if isinstance(na, datetime):
+            days = (na.date() - date.today()).days
+            lines.append(f"**Not after:** {na.strftime('%Y-%m-%d')} ({days} days)  ")
+        sans = cert.get("sans") or []
+        if sans:
+            shown = sans[:10]
+            extra = f" (+{len(sans) - 10} more)" if len(sans) > 10 else ""
+            lines.append(f"**SANs:** {', '.join(shown)}{extra}  ")
+        lines.append("")
 
     # --- Hosting ---
     if hosting:
@@ -625,6 +860,7 @@ def main() -> None:
         print("       Run: pip install python-whois\n")
 
     domain_expiries: list[tuple[str, str, datetime]] = []
+    cert_expiries:   list[tuple[str, str, datetime]] = []
 
     for row in customers:
         customer_name = row.get("customer_name", "Unknown").strip()
@@ -674,17 +910,33 @@ def main() -> None:
             f"DKIM={'✓ (' + ', '.join(s for s, _ in dkim_hits) + ')' if dkim_hits else '?'}"
         )
 
-        # Domain expiry
-        expiry: datetime | None = None
+        # WHOIS
+        whois_info: dict | None = None
         if HAS_WHOIS:
-            print("  Checking domain expiry…", end=" ", flush=True)
-            expiry = get_domain_expiry(domain)
-            if expiry:
-                days = (expiry.date() - date.today()).days
-                print(f"{expiry.strftime('%Y-%m-%d')} ({days} days)")
-                domain_expiries.append((customer_name, domain, expiry))
+            print("  Checking WHOIS…", end=" ", flush=True)
+            whois_info = get_whois_info(domain)
+            exp = whois_info.get("expires")
+            if isinstance(exp, datetime):
+                days = (exp.date() - date.today()).days
+                reg = whois_info.get("registrar") or "?"
+                print(f"{reg}, expires {exp.strftime('%Y-%m-%d')} ({days} days)")
+                domain_expiries.append((customer_name, domain, exp))
             else:
-                print("not found")
+                print(whois_info.get("registrar") or "no data")
+
+        # TLS certificate
+        print("  Checking TLS cert…", end=" ", flush=True)
+        cert = pick_cert(domain)
+        if cert and cert.get("not_after"):
+            na = cert["not_after"]
+            days = (na.date() - date.today()).days
+            issuer = cert.get("issuer_org") or cert.get("issuer_cn") or "unknown"
+            le = " (LE auto-renew)" if cert.get("is_lets_encrypt") else ""
+            print(f"{issuer}, expires {na.strftime('%Y-%m-%d')} ({days} days){le}")
+            if not cert.get("is_lets_encrypt"):
+                cert_expiries.append((customer_name, domain, na))
+        else:
+            print("not reachable")
 
         # Subdomains
         print("  Checking crt.sh for subdomains…", end=" ", flush=True)
@@ -694,7 +946,8 @@ def main() -> None:
         # Build and write markdown
         md = build_markdown(
             customer_name, domain, notes, records, subdomains,
-            hosting=hosting, email_sec=email_sec, redirects=redirects, expiry=expiry,
+            hosting=hosting, email_sec=email_sec, redirects=redirects,
+            whois_info=whois_info, cert=cert,
         )
         safe_name = domain.replace(".", "_")
         out_path = OUTPUT_DIR / f"{safe_name}.md"
@@ -708,10 +961,13 @@ def main() -> None:
         time.sleep(1.5)
 
     # Write renewal calendar
-    if domain_expiries:
+    if domain_expiries or cert_expiries:
         ics_path = OUTPUT_DIR / "dns_renewals.ics"
-        write_ics(domain_expiries, ics_path)
-        print(f"✓ Renewal calendar → {ics_path}  ({len(domain_expiries)} domain(s))")
+        write_ics(domain_expiries, cert_expiries, ics_path)
+        print(
+            f"✓ Renewal calendar → {ics_path}  "
+            f"({len(domain_expiries)} domain, {len(cert_expiries)} cert event(s))"
+        )
 
     (OUTPUT_DIR / ".run_date").write_text(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     print(f"\nDone. Markdown files written to ./{OUTPUT_DIR}/")
