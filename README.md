@@ -69,7 +69,7 @@ python dns_fetch.py --archive             # snapshot previous run first
 python dns_fetch.py --archive --op-sync   # all three together
 ```
 
-Output goes to `./dns_records/<domain>.md`, with `dns_renewals.ics` written alongside for any domains that had a discoverable expiry date. Re-runs overwrite, so the script is safe to run as often as you like. The script sleeps 1.5s between domains to be polite to crt.sh.
+Output goes to `./dns_records/<domain>.md`, with `dns_renewals.ics` written alongside whenever at least one domain produces a domain-expiry or non-Let's-Encrypt cert-expiry event. Re-runs overwrite, so the script is safe to run as often as you like. The script sleeps 1.5s between domains to be polite to crt.sh.
 
 `--archive` copies the existing `dns_records/` to `dns_records_<timestamp>/` (e.g. `dns_records_2026-05-13_10-30-45/`) using the timestamp recorded at the end of the previous run, so snapshots are labelled by when their data was captured. The archive will fail if the destination directory already exists — delete or rename it first if you need to re-archive.
 
